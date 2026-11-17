@@ -7,7 +7,11 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 
-from services.database import listar_atividades, salvar_atividade
+from services.database import (
+    deletar_atividade,
+    listar_atividades,
+    salvar_atividade,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -59,6 +63,38 @@ def _parse_intervalo(texto: str) -> tuple[Optional[str], Optional[str], bool]:
         return None, None, False
 
 
+def limpar_importacoes_antigas_sigaa() -> int:
+    """
+    Remove do banco qualquer registro importado da antiga consulta geral
+    (consulta_extensao.jsf) e inscrições do SIGAA que já venceram.
+    """
+    hoje = date.today()
+    todas = listar_atividades(status="aprovado") + listar_atividades(status="pendente")
+    removidos = 0
+
+    for item in todas:
+        link = item.get("link_inscricao") or ""
+
+        # Remove tudo que veio da página antiga de busca geral
+        if "consulta_extensao.jsf" in link:
+            deletar_atividade(item["id"])
+            removidos += 1
+            continue
+
+        # Remove ações da página de inscrições abertas cujo prazo já passou
+        if "paginaListaPeriodosInscricoesAtividadesPublico.jsf" in link:
+            prazo = item.get("prazo_inscricao")
+            if prazo:
+                try:
+                    if date.fromisoformat(str(prazo)[:10]) < hoje:
+                        deletar_atividade(item["id"])
+                        removidos += 1
+                except ValueError:
+                    pass
+
+    return removidos
+
+
 def buscar_inscricoes_abertas_sigaa() -> list[dict]:
     """
     Consulta exclusivamente a lista pública de Cursos e Eventos de Extensão
@@ -73,7 +109,6 @@ def buscar_inscricoes_abertas_sigaa() -> list[dict]:
 
     tabela = soup.find("table", class_="listagem")
 
-    # Caso a página exija submeter o botão Buscar antes de listar
     if not tabela:
         form = soup.find("form")
         if form:
@@ -111,7 +146,6 @@ def buscar_inscricoes_abertas_sigaa() -> list[dict]:
 
         texto_linha = " | ".join(colunas)
 
-        # Identifica intervalos de datas na linha (1º = inscrição, 2º = realização)
         intervalos = re.findall(r"\d{2}/\d{2}/\d{4}\s*(?:a|até|-)\s*\d{2}/\d{2}/\d{4}", texto_linha)
         if not intervalos:
             continue
@@ -152,9 +186,13 @@ def buscar_inscricoes_abertas_sigaa() -> list[dict]:
 
 def sincronizar_sigaa_com_banco(status_inicial: str = "pendente") -> int:
     """
-    Importa ações com inscrição aberta do SIGAA evitando duplicatas.
-    Por padrão salva como 'pendente' para revisão rápida na aba Moderação.
+    Limpa sobras da página antiga e importa apenas ações com inscrição aberta
+    do SIGAA para a fila de moderação.
     """
+    removidos = limpar_importacoes_antigas_sigaa()
+    if removidos:
+        print(f"Limpeza: {removidos} registro(s) antigo(s) removido(s) do banco.")
+
     existentes = listar_atividades(status="aprovado") + listar_atividades(status="pendente")
     titulos_existentes = {item["titulo"].strip().lower() for item in existentes}
 
@@ -174,7 +212,7 @@ def sincronizar_sigaa_com_banco(status_inicial: str = "pendente") -> int:
 
 
 if __name__ == "__main__":
-    print("Buscando cursos e eventos com inscrições abertas no SIGAA UFPE...")
+    print("Limpando registros antigos e buscando inscrições abertas no SIGAA UFPE...")
     try:
         qtd = sincronizar_sigaa_com_banco(status_inicial="pendente")
         print(f"Concluído! {qtd} oportunidade(s) enviada(s) para a fila de moderação.")
